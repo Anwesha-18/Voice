@@ -1,5 +1,5 @@
 """
-GestureSpeak — Real-Time Recognition App  (v3 — final)
+VOICE — Real-Time Recognition App  (v3 — final)
 app/app.py
 
 Run:  streamlit run app/app.py
@@ -38,7 +38,7 @@ import streamlit as st
 # PAGE CONFIG  (must be the very first Streamlit call)
 # ─────────────────────────────────────────────
 st.set_page_config(
-    page_title="GestureSpeak",
+    page_title="VOICE",
     page_icon="🤟",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -517,7 +517,7 @@ def main():
     ss = st.session_state
 
     # ── Header ─────────────────────────────────────────────────────
-    st.markdown('<div class="gs-title">🤟 GESTURESPEAK</div>', unsafe_allow_html=True)
+    st.markdown('<div class="gs-title">🤟 VOICE</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="gs-subtitle">REAL-TIME SIGN LANGUAGE RECOGNITION</div>',
         unsafe_allow_html=True
