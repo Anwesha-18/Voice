@@ -1,4 +1,4 @@
-# 🤟 GestureSpeak
+# VOICE
 
 **Real-time sign language recognition system** — recognises 21 ASL-inspired signs from your webcam, builds sentences, and speaks them aloud.
 
@@ -7,7 +7,7 @@
 ## Quick Start
 
 ```
-GESTURESPEAK/
+VOICE/
 ├── dataset/
 │   └── raw_sequences/<word>/seq_XXX.npy
 ├── preprocessing/
