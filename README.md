@@ -16,8 +16,17 @@ VOICE/
 ├── model/
 │   ├── architectures.py
 │   └── train.py             ← Step 3
-├── app/
-│   └── app.py               ← Step 4 (Streamlit UI)
+├── backend/
+│   ├── app.py               ← Flask inference server
+│   └── requirements.txt
+├── frontend/
+│   ├── index.html
+│   ├── package.json
+│   ├── src/
+│   │   ├── App.jsx
+│   │   ├── main.jsx
+│   │   └── styles.css
+│   └── vite.config.js
 ├── outputs/
 │   └── saved_models/
 │       ├── best_model.h5
@@ -100,22 +109,25 @@ Typical training time: 5–15 min on CPU, 1–3 min with GPU.
 ### 4 — Run App
 
 ```bash
-streamlit run app/app.py
+pip install -r backend/requirements.txt
+cd frontend
+npm install
+npm run dev
 ```
 
-Opens in your browser at `http://localhost:8501`.
+Open the React UI at `http://localhost:3000`. The frontend proxies `/api` calls to the Flask server on port `5000`.
 
 **Features:**
-- 🎥 Live webcam with hand skeleton overlay
-- 🔤 Large neon word display with confidence score
-- 📊 Top-3 prediction confidence bars
-- 📝 Sentence builder (auto-appends confirmed words)
-- 🔊 **Speak** button reads your sentence aloud
-- ⌫ Remove last word / ✕ Clear sentence
+- 🎥 Browser webcam capture with fast preview
+- 🔤 Neon prediction display with live confidence
+- 📊 Top-3 scoring and buffer progress
+- 📝 Sentence builder with automatic append logic
+- 🔊 Browser-native speech synthesis (no `pyttsx3` dependency)
+- ✨ Futuristic dark neon UI with responsive layout
 
 **Word is appended to sentence when:**
-- Confidence > 60%
-- Same word held for 10+ consecutive frames
+- Confidence ≥ 60%
+- Same word held for several consecutive frames
 - Word is not `idle`
 - Word differs from the last appended word
 

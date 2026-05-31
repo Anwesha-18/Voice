@@ -3,3 +3,11 @@ __pycache__/
 venv/
 .env
 .ipynb_checkpoints/
+
+# Node modules
+frontend/node_modules/
+node_modules/
+
+# Build outputs
+dist/
+build/
