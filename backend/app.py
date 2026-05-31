@@ -7,10 +7,24 @@ import time
 from collections import deque
 
 import cv2
-import mediapipe as mp
+mp_solutions = None
+mp_import_error = None
+try:
+    from mediapipe.python import solutions as mp_solutions
+except Exception as exc:
+    mp_import_error = exc
 import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from dotenv import load_dotenv
+genai = None
+genai_import_error = None
+try:
+    import google.generativeai as genai
+except Exception as exc:
+    genai_import_error = exc
+
+load_dotenv()
 
 # Ensure the root repo path is available for importing model.architectures
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,13 +57,31 @@ label_map = {}
 client_buffers = {}
 client_lock = threading.Lock()
 
-mp_holistic = mp.solutions.holistic
+mp_holistic = mp_solutions.holistic if mp_solutions is not None else None
+holistic = None
+holistic_init_error = mp_import_error
 
-holistic = mp_holistic.Holistic(
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-    model_complexity=0,  # Lightweight model for faster two-hand detection
-)
+
+def init_holistic():
+    global holistic, holistic_init_error
+    if holistic is not None:
+        return holistic
+    if holistic_init_error is not None:
+        return None
+    if mp_holistic is None:
+        holistic_init_error = RuntimeError("mediapipe is unavailable")
+        return None
+
+    try:
+        holistic = mp_holistic.Holistic(
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+            model_complexity=0,  # Lightweight model for faster two-hand detection
+        )
+        return holistic
+    except Exception as exc:
+        holistic_init_error = exc
+        return None
 
 
 def decode_image_data(data_url: str):
@@ -136,11 +168,46 @@ def load_model():
         except Exception:
             pass
 
+    import importlib
     import tensorflow as tf
-    model = tf.keras.models.load_model(
-        MODEL_PATH,
-        custom_objects={"AttentionLayer": AttentionLayer},
-    )
+
+    keras_functional = importlib.import_module("keras.src.models.functional").Functional
+    custom_objects = {
+        "Functional": keras_functional,
+        "AttentionLayer": AttentionLayer,
+        "LSTM": tf.keras.layers.LSTM,
+        "Bidirectional": tf.keras.layers.Bidirectional,
+        "Dropout": tf.keras.layers.Dropout,
+        "Dense": tf.keras.layers.Dense,
+        "BatchNormalization": tf.keras.layers.BatchNormalization,
+        "InputLayer": tf.keras.layers.InputLayer,
+    }
+
+    def _strip_time_major(config_obj):
+        if isinstance(config_obj, dict):
+            config_obj.pop("time_major", None)
+            for value in config_obj.values():
+                _strip_time_major(value)
+        elif isinstance(config_obj, list):
+            for item in config_obj:
+                _strip_time_major(item)
+
+    def _load_legacy_h5_model():
+        import h5py
+
+        with h5py.File(MODEL_PATH, "r") as h5f:
+            raw_config = h5f.attrs["model_config"]
+            config = json.loads(raw_config if isinstance(raw_config, str) else raw_config.decode("utf-8"))
+
+        _strip_time_major(config)
+        return tf.keras.models.model_from_json(json.dumps(config), custom_objects=custom_objects)
+
+    try:
+        model = tf.keras.models.load_model(MODEL_PATH, custom_objects=custom_objects)
+    except Exception:
+        model = _load_legacy_h5_model()
+        model.load_weights(MODEL_PATH)
+
     model_runner = ModelRunner(model, label_map)
 
 
@@ -168,6 +235,101 @@ def ping():
     return jsonify({"status": "ok", "message": "Flask backend is ready"})
 
 
+def _simple_fallback_sentence(words):
+    if not words:
+        return ""
+    lw = [w.lower() for w in words]
+    # Heuristic rules for common intents
+    if "doctor" in lw and "help" in lw:
+        return "I need a doctor, please help me."
+    if "help" in lw and "please" in lw:
+        return "Please help me."
+    if "help" in lw:
+        return "Help me, please."
+    if "thank" in " ".join(lw) or "thank_you" in lw:
+        return "Thank you."
+    # Generic fallback: join and punctuate
+    s = " ".join(words).strip()
+    if not s:
+        return ""
+    if not s.endswith('.') and not s.endswith('!') and not s.endswith('?'):
+        s = s + '.'
+    return s[0].upper() + s[1:]
+
+
+@app.route("/api/generate-sentence", methods=["POST"])
+def generate_sentence():
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "Missing JSON payload"}), 400
+
+    words = payload.get("words")
+    if not isinstance(words, list) or not words:
+        return jsonify({"error": "`words` must be a non-empty list"}), 400
+
+    # Try to call Gemini using API key from .env
+    try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set in environment")
+        if genai is None:
+            raise RuntimeError(f"Gemini client unavailable: {genai_import_error}")
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        prompt = f"""
+        You are an assistive communication system for non-verbal sign language users.
+
+        Your task is to infer the user's most likely intended message from detected sign language words.
+
+        Detected words:
+        {' '.join(words)}
+
+        Rules:
+        - Infer the user's intended meaning.
+        - Convert the words into ONE natural sentence.
+        - Prioritize practical communication needs.
+        - Keep the sentence concise and clear.
+        - Do not explain your reasoning.
+        - Do not add unnecessary details.
+        - Return ONLY the sentence.
+
+        Examples:
+
+        help doctor please
+        → I need a doctor, please help me.
+
+        water please
+        → Could I please have some water?
+
+        bathroom
+        → I need to use the bathroom.
+
+        hungry food
+        → I am hungry and would like some food.
+
+        thank you
+        → Thank you.
+
+        Now generate the sentence.
+        """
+
+        response = model.generate_content(prompt)
+        sentence = getattr(response, "text", None)
+        if sentence:
+            sentence = sentence.strip()
+        if not sentence:
+            raise ValueError("Empty response from Gemini")
+
+        return jsonify({"sentence": sentence})
+
+    except Exception as exc:
+        # Fallback behavior: return a deterministic heuristic-based sentence
+        fallback = _simple_fallback_sentence(words)
+        return jsonify({"sentence": fallback, "fallback": True, "error": str(exc)}), 200
+
+
 @app.route("/api/predict", methods=["POST"])
 def predict():
     if model_runner is None:
@@ -189,10 +351,17 @@ def predict():
     except Exception as exc:
         return jsonify({"error": f"Invalid image data: {exc}"}), 400
 
+    hol = init_holistic()
+    if hol is None:
+        msg = "Mediapipe Holistic initialization failed"
+        if holistic_init_error is not None:
+            msg = f"Mediapipe Holistic initialization failed: {holistic_init_error}"
+        return jsonify({"error": msg}), 503
+
     # Flip horizontally to match training data (model was trained on mirrored frames)
     image = cv2.flip(image, 1)
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = holistic.process(rgb_image)
+    results = hol.process(rgb_image)
 
     buffer_record = get_client_buffer(client_id)
     progress = len(buffer_record["frames"]) / SEQ_LEN

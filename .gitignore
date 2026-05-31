@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
 .env
 .ipynb_checkpoints/
 
@@ -11,3 +12,6 @@ node_modules/
 # Build outputs
 dist/
 build/
+
+# VS Code
+.vscode/
