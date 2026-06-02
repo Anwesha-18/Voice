@@ -171,9 +171,7 @@ def load_model():
     import importlib
     import tensorflow as tf
 
-    keras_functional = importlib.import_module("keras.src.models.functional").Functional
     custom_objects = {
-        "Functional": keras_functional,
         "AttentionLayer": AttentionLayer,
         "LSTM": tf.keras.layers.LSTM,
         "Bidirectional": tf.keras.layers.Bidirectional,

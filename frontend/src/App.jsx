@@ -72,13 +72,15 @@ export default function App() {
   const [bufferProgress, setBufferProgress] = useState(0);
   const [sentence, setSentence] = useState([]);
   const sentenceRef = useRef([]);
-  const [sentenceMode, setSentenceMode] = useState(false);
+  const [sentenceBuilderActive, setSentenceBuilderActive] = useState(false);
+  const [generatedSentence, setGeneratedSentence] = useState("");
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [error, setError] = useState("");
   const busyRef = useRef(false);
   const consecWordRef = useRef(null);
   const consecCountRef = useRef(0);
   const lastSpokenRef = useRef("");
+  const builderCooldownRef = useRef({});
 
   useEffect(() => {
     sentenceRef.current = sentence;
@@ -114,7 +116,7 @@ export default function App() {
       captureFrame();
     }, CAPTURE_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [cameraReady, sentenceMode, autoSpeak]);
+  }, [cameraReady, sentenceBuilderActive, autoSpeak]);
 
   useEffect(() => {
     const canvas = overlayCanvasRef.current;
@@ -235,8 +237,8 @@ export default function App() {
         lastSpokenRef.current = "";
       }
 
-      if (sentenceMode && maybeAppendWord(word, confidence)) {
-        speakText(word);
+      if (sentenceBuilderActive) {
+        maybeAppendWord(word, confidence);
       }
     } catch (err) {
       setError(err.message);
@@ -260,13 +262,20 @@ export default function App() {
     }
     if (consecCountRef.current >= APPEND_FRAMES) {
       const lastWord = sentenceRef.current[sentenceRef.current.length - 1] || "";
-      if (word !== lastWord) {
-        const nextSentence = [...sentenceRef.current, word];
-        sentenceRef.current = nextSentence;
-        setSentence(nextSentence);
-        consecCountRef.current = 0;
-        return true;
+      if (word === lastWord) {
+        return false;
       }
+      const now = Date.now();
+      const lastAdded = builderCooldownRef.current[word] || 0;
+      if (now - lastAdded < 1200) {
+        return false;
+      }
+      builderCooldownRef.current[word] = now;
+      const nextSentence = [...sentenceRef.current, word];
+      sentenceRef.current = nextSentence;
+      setSentence(nextSentence);
+      consecCountRef.current = 0;
+      return true;
     }
     return false;
   };
@@ -289,8 +298,48 @@ export default function App() {
   const handleClear = () => {
     sentenceRef.current = [];
     setSentence([]);
+    setGeneratedSentence("");
     consecWordRef.current = null;
     consecCountRef.current = 0;
+    builderCooldownRef.current = {};
+  };
+
+  const handleStartSentenceBuilder = () => {
+    sentenceRef.current = [];
+    setSentence([]);
+    setGeneratedSentence("");
+    setSentenceBuilderActive(true);
+    setError("");
+    consecWordRef.current = null;
+    consecCountRef.current = 0;
+    builderCooldownRef.current = {};
+    setStatus("Sentence builder started");
+  };
+
+  const handleStopSentenceBuilder = async () => {
+    if (!sentence.length) {
+      setError("No collected words to generate a sentence.");
+      return;
+    }
+    setSentenceBuilderActive(false);
+    setStatus("Generating sentence...");
+    try {
+      const response = await fetch("/api/generate-sentence", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ words: sentence }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "Sentence generation failed");
+      }
+      setGeneratedSentence(payload.sentence || "");
+      setStatus("Sentence generated");
+      setError("");
+    } catch (err) {
+      setError(err.message);
+      setStatus("Sentence generation failed");
+    }
   };
 
   return (
@@ -348,12 +397,9 @@ export default function App() {
             ))}
           </div>
 
-          <div className="toggle-row">
-            <label className="toggle-switch">
-              <input type="checkbox" checked={sentenceMode} onChange={() => setSentenceMode(!sentenceMode)} />
-              <span className="slider" />
-            </label>
-            <span>Sentence mode</span>
+          <div className="button-row">
+            <button onClick={handleStartSentenceBuilder} disabled={sentenceBuilderActive}>Start Sentence Builder</button>
+            <button onClick={handleStopSentenceBuilder} disabled={!sentenceBuilderActive}>Stop Sentence Builder</button>
           </div>
           <div className="toggle-row">
             <label className="toggle-switch">
@@ -381,12 +427,18 @@ export default function App() {
         <section className="panel panel-glow panel-bottom">
           <div className="panel-header">
             <span>Sentence builder</span>
-            <span className="micro-status">{sentenceMode ? "Recording" : "Paused"}</span>
+            <span className="micro-status">{sentenceBuilderActive ? "Recording" : "Paused"}</span>
           </div>
           <div className="sentence-box">
             {sentence.length > 0 ? sentence.map((word, index) => (
               <span key={`${word}-${index}`} className="sentence-token">{word.replace(/_/g, " ")}</span>
-            )) : <span className="sentence-empty">Hold a sign to add it to your sentence.</span>}
+            )) : <span className="sentence-empty">Start builder and hold a sign to add words.</span>}
+          </div>
+          <div className="sentence-result">
+            <div className="sentence-result-label">Generated sentence</div>
+            <div className="sentence-result-text">
+              {generatedSentence || "Press Stop to generate a sentence from collected words."}
+            </div>
           </div>
         </section>
       </div>

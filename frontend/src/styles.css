@@ -330,6 +330,29 @@ button {
   font-weight: 600;
 }
 
+.sentence-result {
+  margin-top: 18px;
+  padding: 18px;
+  background: rgba(5, 10, 21, 0.85);
+  border-radius: 22px;
+  border: 1px solid rgba(93, 190, 255, 0.12);
+  color: #d4e4ff;
+}
+
+.sentence-result-label {
+  color: #8bbdff;
+  font-size: 0.88rem;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  margin-bottom: 10px;
+}
+
+.sentence-result-text {
+  font-size: 1rem;
+  line-height: 1.6;
+  color: #f6fbff;
+}
+
 .sentence-empty {
   color: #647a9d;
   letter-spacing: 0.08em;
