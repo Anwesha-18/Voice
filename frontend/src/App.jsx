@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
 const SEQ_LEN = 30;
-const APPEND_THRESHOLD = 0.60;
-const APPEND_FRAMES = 4;
-const CAPTURE_INTERVAL_MS = 40;
+const APPEND_THRESHOLD = 0.50;  // Aggressive: lower for faster recognition
+const APPEND_FRAMES = 1;  // Minimal: single confident prediction adds word
+const CAPTURE_INTERVAL_MS = 25;  // Very fast: 40 FPS for rapid frame capture
 const IDLE_WORD = "";
 
 const HAND_CONNECTIONS = [
@@ -74,13 +74,19 @@ export default function App() {
   const sentenceRef = useRef([]);
   const [sentenceBuilderActive, setSentenceBuilderActive] = useState(false);
   const [generatedSentence, setGeneratedSentence] = useState("");
+  const [sentenceStatusBase, setSentenceStatusBase] = useState("");
+  const [sentenceStatusDotCount, setSentenceStatusDotCount] = useState(0);
   const [autoSpeak, setAutoSpeak] = useState(true);
+  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState("");
   const busyRef = useRef(false);
+  const sentenceStatusTimerRef = useRef(null);
+  const sentenceStatusTickerRef = useRef(null);
   const consecWordRef = useRef(null);
   const consecCountRef = useRef(0);
   const lastSpokenRef = useRef("");
   const builderCooldownRef = useRef({});
+  const exitButtonRef = useRef(null);
 
   useEffect(() => {
     sentenceRef.current = sentence;
@@ -112,11 +118,11 @@ export default function App() {
 
   useEffect(() => {
     const interval = setInterval(() => {
-      if (!cameraReady || busyRef.current) return;
+      if (!cameraReady || busyRef.current || analyzing) return;
       captureFrame();
     }, CAPTURE_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [cameraReady, sentenceBuilderActive, autoSpeak]);
+  }, [cameraReady, sentenceBuilderActive, autoSpeak, analyzing]);
 
   useEffect(() => {
     const canvas = overlayCanvasRef.current;
@@ -237,7 +243,7 @@ export default function App() {
         lastSpokenRef.current = "";
       }
 
-      if (sentenceBuilderActive) {
+      if (!analyzing) {
         maybeAppendWord(word, confidence);
       }
     } catch (err) {
@@ -267,7 +273,7 @@ export default function App() {
       }
       const now = Date.now();
       const lastAdded = builderCooldownRef.current[word] || 0;
-      if (now - lastAdded < 1200) {
+      if (now - lastAdded < 600) {  // Reduced from 800ms to 600ms for faster back-to-back words
         return false;
       }
       builderCooldownRef.current[word] = now;
@@ -281,39 +287,66 @@ export default function App() {
   };
 
   const handleSpeakWord = () => {
-    if (prediction.word) speakText(prediction.word);
+    if (sentenceBuilderActive || analyzing) return;
+    const lastWord = sentence[sentence.length - 1] || prediction.word;
+    if (lastWord) speakText(lastWord);
   };
 
   const handleSpeakSentence = () => {
+    if (analyzing) return;
+    if (sentenceBuilderActive) {
+      if (!generatedSentence) return;
+      speakText(generatedSentence);
+      return;
+    }
     if (!sentence.length) return;
     speakText(sentence.map((w) => w.replace(/_/g, " ")).join(" "));
   };
 
+  const clearSentenceStatusTimer = () => {
+    if (sentenceStatusTimerRef.current) {
+      window.clearTimeout(sentenceStatusTimerRef.current);
+      sentenceStatusTimerRef.current = null;
+    }
+    if (sentenceStatusTickerRef.current) {
+      window.clearInterval(sentenceStatusTickerRef.current);
+      sentenceStatusTickerRef.current = null;
+    }
+  };
+
   const handleRemove = () => {
+    if (sentenceBuilderActive || analyzing) return;
     const nextSentence = sentence.slice(0, -1);
     sentenceRef.current = nextSentence;
     setSentence(nextSentence);
   };
 
   const handleClear = () => {
+    if (analyzing) return;
+    clearSentenceStatusTimer();
     sentenceRef.current = [];
     setSentence([]);
     setGeneratedSentence("");
+    setSentenceStatusBase("");
+    setSentenceStatusDotCount(0);
     consecWordRef.current = null;
     consecCountRef.current = 0;
     builderCooldownRef.current = {};
   };
 
   const handleStartSentenceBuilder = () => {
+    clearSentenceStatusTimer();
     sentenceRef.current = [];
     setSentence([]);
     setGeneratedSentence("");
+    setSentenceStatusBase("");
+    setSentenceStatusDotCount(0);
     setSentenceBuilderActive(true);
     setError("");
     consecWordRef.current = null;
     consecCountRef.current = 0;
     builderCooldownRef.current = {};
-    setStatus("Sentence builder started");
+    setStatus("Assisted communication started");
   };
 
   const handleStopSentenceBuilder = async () => {
@@ -322,7 +355,17 @@ export default function App() {
       return;
     }
     setSentenceBuilderActive(false);
-    setStatus("Generating sentence...");
+    setAnalyzing(true);
+    setGeneratedSentence("");
+    setSentenceStatusBase("Analysing");
+    setSentenceStatusDotCount(0);
+    clearSentenceStatusTimer();
+    sentenceStatusTickerRef.current = window.setInterval(() => {
+      setSentenceStatusDotCount((count) => (count + 1) % 4);
+    }, 500);
+    setStatus("Analysing");
+    setError("");
+
     try {
       const response = await fetch("/api/generate-sentence", {
         method: "POST",
@@ -333,13 +376,47 @@ export default function App() {
       if (!response.ok) {
         throw new Error(payload.error || "Sentence generation failed");
       }
-      setGeneratedSentence(payload.sentence || "");
-      setStatus("Sentence generated");
+      const finalSentence = payload.sentence || "";
+      clearSentenceStatusTimer();
+      setGeneratedSentence(finalSentence);
+      setSentenceStatusBase("");
+      setSentenceStatusDotCount(0);
+        setStatus("Sentence generated");
       setError("");
+      setAnalyzing(false);
+      if (autoSpeak && finalSentence) {
+        speakText(finalSentence);
+      }
     } catch (err) {
+      clearSentenceStatusTimer();
+      setSentenceStatusBase("");
+      setSentenceStatusDotCount(0);
       setError(err.message);
       setStatus("Sentence generation failed");
+      setAnalyzing(false);
     }
+  };
+
+  useEffect(() => {
+    if (generatedSentence && !sentenceBuilderActive && !analyzing) {
+      exitButtonRef.current?.focus();
+    }
+  }, [generatedSentence, sentenceBuilderActive, analyzing]);
+
+  const handleExitCommunicationMode = () => {
+    if (analyzing) return;
+    clearSentenceStatusTimer();
+    setSentenceBuilderActive(false);
+    setGeneratedSentence("");
+    setSentenceStatusBase("");
+    setSentenceStatusDotCount(0);
+    sentenceRef.current = [];
+    setSentence([]);
+    consecWordRef.current = null;
+    consecCountRef.current = 0;
+    builderCooldownRef.current = {};
+    setError("");
+    setStatus("Assisted communication exited");
   };
 
   return (
@@ -347,7 +424,7 @@ export default function App() {
       <div className="top-bar">
         <div>
           <div className="hero-title">VOICE</div>
-          <div className="hero-subtitle">Neon sign language recognition with React + Flask</div>
+          <div className="hero-subtitle">Real-Time Sign Language Communication</div>
         </div>
         <div className="status-pill">{status}</div>
       </div>
@@ -369,11 +446,23 @@ export default function App() {
             <canvas ref={captureCanvasRef} width={320} height={240} hidden />
             <video ref={videoRef} muted playsInline hidden />
           </div>
-          <div className="progress-row">
-            <div className="progress-label">Buffer</div>
-            <div className="progress-bar">
-              <div className="progress-fill" style={{ width: `${bufferProgress * 100}%` }} />
-            </div>
+          <div className="button-row camera-button-row">
+            <button
+              onClick={sentenceBuilderActive ? handleStopSentenceBuilder : handleStartSentenceBuilder}
+              className={sentenceBuilderActive ? "btn-active-comm" : "camera-start-btn"}
+              disabled={analyzing || (generatedSentence && !sentenceBuilderActive)}
+            >
+              {sentenceBuilderActive ? "Stop detecting" : "Start assisted communication mode"}
+            </button>
+            {(sentenceBuilderActive || generatedSentence) && (
+              <button
+                ref={exitButtonRef}
+                onClick={handleExitCommunicationMode}
+                disabled={analyzing || (!sentenceBuilderActive && !generatedSentence)}
+              >
+                Exit assisted communication mode
+              </button>
+            )}
           </div>
           {error ? <div className="error-banner">{error}</div> : null}
         </section>
@@ -386,7 +475,9 @@ export default function App() {
           <div className="big-word">{formatLabel(prediction.word)}</div>
           <div className="confidence-card">
             <div>Confidence</div>
-            <div className="confidence-score">{Math.round(prediction.confidence * 100)}%</div>
+            <div className="confidence-score">
+              {(!prediction.word || analyzing || !cameraReady) ? 0 : Math.round(prediction.confidence * 100)}%
+            </div>
           </div>
           <div className="top3-list">
             {prediction.top3.map((item, index) => (
@@ -397,10 +488,6 @@ export default function App() {
             ))}
           </div>
 
-          <div className="button-row">
-            <button onClick={handleStartSentenceBuilder} disabled={sentenceBuilderActive}>Start Sentence Builder</button>
-            <button onClick={handleStopSentenceBuilder} disabled={!sentenceBuilderActive}>Stop Sentence Builder</button>
-          </div>
           <div className="toggle-row">
             <label className="toggle-switch">
               <input type="checkbox" checked={autoSpeak} onChange={() => setAutoSpeak(!autoSpeak)} />
@@ -408,40 +495,35 @@ export default function App() {
             </label>
             <span>Auto speak</span>
           </div>
-          <div className="toggle-row">
-            <label className="toggle-switch">
-              <input type="checkbox" checked={mirrorPreview} onChange={() => setMirrorPreview(!mirrorPreview)} />
-              <span className="slider" />
-            </label>
-            <span>Toggle mirror</span>
-          </div>
-
           <div className="button-row">
-            <button onClick={handleSpeakWord}>Speak word</button>
-            <button onClick={handleSpeakSentence}>Speak sentence</button>
-            <button onClick={handleRemove}>Remove last</button>
-            <button onClick={handleClear}>Clear</button>
+            <button onClick={handleSpeakWord} disabled={sentenceBuilderActive || analyzing}>Speak word</button>
+            <button onClick={handleSpeakSentence} disabled={analyzing || (sentenceBuilderActive && !generatedSentence)}>
+              Speak sentence
+            </button>
+            <button onClick={handleRemove} disabled={sentenceBuilderActive || analyzing}>Remove last</button>
+            <button onClick={handleClear} disabled={analyzing}>Clear</button>
           </div>
         </section>
 
         <section className="panel panel-glow panel-bottom">
           <div className="panel-header">
-            <span>Sentence builder</span>
-            <span className="micro-status">{sentenceBuilderActive ? "Recording" : "Paused"}</span>
+            <span>Words detected</span>
+            <span className="micro-status">{sentenceBuilderActive ? "Recording" : analyzing ? "Analysing" : "Live"}</span>
           </div>
           <div className="sentence-box">
             {sentence.length > 0 ? sentence.map((word, index) => (
               <span key={`${word}-${index}`} className="sentence-token">{word.replace(/_/g, " ")}</span>
-            )) : <span className="sentence-empty">Start builder and hold a sign to add words.</span>}
-          </div>
-          <div className="sentence-result">
-            <div className="sentence-result-label">Generated sentence</div>
-            <div className="sentence-result-text">
-              {generatedSentence || "Press Stop to generate a sentence from collected words."}
-            </div>
+            )) : <span className="sentence-empty">Words history will appear here as you sign.</span>}
           </div>
         </section>
       </div>
+      {generatedSentence ? (
+        <div className="sentence-banner">{generatedSentence}</div>
+      ) : sentenceStatusBase ? (
+        <div className="sentence-status-banner">
+          {sentenceStatusBase}{".".repeat(sentenceStatusDotCount)}
+        </div>
+      ) : null}
     </div>
   );
 }

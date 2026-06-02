@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections import deque
+import logging
 
 import cv2
 mp_solutions = None
@@ -41,9 +42,14 @@ app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 # Model / prediction settings
 SEQ_LEN = 30
 FEATURE_SIZE = 126
-CONF_THRESHOLD = 0.70  # Increased: only predict when very confident (was 0.40)
-APPEND_THRESHOLD = 0.60
+CONF_THRESHOLD = 0.55  # Aggressive: faster recognition with lower accuracy barrier
+APPEND_THRESHOLD = 0.50  # Aggressive: frontend responsiveness
 CLIENT_TIMEOUT_SECONDS = 90
+
+# Timing and logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+ENABLE_TIMING_LOGS = os.getenv('ENABLE_TIMING_LOGS', 'false').lower() == 'true'
 
 MODEL_DIR = os.path.join(ROOT_DIR, "outputs", "saved_models")
 MODEL_PATH = os.path.join(MODEL_DIR, "best_model.h5")
@@ -74,9 +80,11 @@ def init_holistic():
 
     try:
         holistic = mp_holistic.Holistic(
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-            model_complexity=0,  # Lightweight model for faster two-hand detection
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
+            model_complexity=2,  # Strongest two-hand tracking
+            smooth_landmarks=False,
+            enable_segmentation=False,
         )
         return holistic
     except Exception as exc:
@@ -233,6 +241,24 @@ def ping():
     return jsonify({"status": "ok", "message": "Flask backend is ready"})
 
 
+@app.route("/api/metrics", methods=["GET"])
+def metrics():
+    """Return performance metrics and buffer statistics."""
+    with client_lock:
+        total_frames_processed = sum(state.get("frame_count", 0) for state in client_buffers.values())
+        num_active_clients = len(client_buffers)
+    
+    return jsonify({
+        "status": "ok",
+        "model_loaded": model_runner is not None,
+        "active_clients": num_active_clients,
+        "total_frames_processed": total_frames_processed,
+        "conf_threshold": CONF_THRESHOLD,
+        "seq_len": SEQ_LEN,
+        "timing_logs_enabled": ENABLE_TIMING_LOGS,
+    })
+
+
 def _simple_fallback_sentence(words):
     if not words:
         return ""
@@ -330,6 +356,7 @@ def generate_sentence():
 
 @app.route("/api/predict", methods=["POST"])
 def predict():
+    request_start = time.time()
     if model_runner is None:
         return jsonify({"error": "Model not loaded"}), 503
 
@@ -343,9 +370,11 @@ def predict():
         return jsonify({"error": "Missing image data"}), 400
 
     try:
+        t_decode_start = time.time()
         image = decode_image_data(image_data)
         if image is None:
             raise ValueError("Unable to decode image")
+        t_decode = time.time() - t_decode_start
     except Exception as exc:
         return jsonify({"error": f"Invalid image data: {exc}"}), 400
 
@@ -357,9 +386,14 @@ def predict():
         return jsonify({"error": msg}), 503
 
     # Flip horizontally to match training data (model was trained on mirrored frames)
+    t_preprocess_start = time.time()
     image = cv2.flip(image, 1)
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    t_preprocess = time.time() - t_preprocess_start
+    
+    t_landmark_start = time.time()
     results = hol.process(rgb_image)
+    t_landmark = time.time() - t_landmark_start
 
     buffer_record = get_client_buffer(client_id)
     progress = len(buffer_record["frames"]) / SEQ_LEN
@@ -388,10 +422,14 @@ def predict():
                 })
         return landmark_list
 
+    t_features_start = time.time()
     features = extract_features(results)
+    t_features = time.time() - t_features_start
     response["landmarks"] = serialize_landmarks(results)
 
     buffer_record["frames"].append(features)
+    buffer_record.setdefault("frame_count", 0)
+    buffer_record["frame_count"] += 1
     progress = len(buffer_record["frames"]) / SEQ_LEN
     response["bufferProgress"] = round(progress, 3)
 
@@ -401,7 +439,10 @@ def predict():
     seq = np.array(buffer_record["frames"], dtype=np.float32)[np.newaxis]
     with model_lock:
         try:
+            t_inference_start = time.time()
             word, confidence, top3 = model_runner.predict(seq)
+            t_inference = time.time() - t_inference_start
+            buffer_record["last_prediction_time"] = request_start
         except Exception as exc:
             return jsonify({"error": f"Inference failed: {exc}"}), 500
 
@@ -412,6 +453,16 @@ def predict():
     response["confidence"] = round(confidence, 4)
     if confidence >= CONF_THRESHOLD and word != "idle":
         response["word"] = word
+
+    # Log timing if enabled
+    if ENABLE_TIMING_LOGS:
+        total_time = (time.time() - request_start) * 1000  # Convert to ms
+        logger.info(
+            f"[{client_id[:8]}] TIMING: decode={t_decode*1000:.1f}ms prep={t_preprocess*1000:.1f}ms "
+            f"landmark={t_landmark*1000:.1f}ms feature={t_features*1000:.1f}ms "
+            f"inference={t_inference*1000:.1f}ms total={total_time:.1f}ms "
+            f"word={word} conf={confidence:.2f} frames={buffer_record['frame_count']}"
+        )
 
     cleanup_stale_clients()
     return jsonify(response)
