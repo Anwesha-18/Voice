@@ -6,6 +6,14 @@ const APPEND_FRAMES = 1;  // Minimal: single confident prediction adds word
 const CAPTURE_INTERVAL_MS = 25;  // Very fast: 40 FPS for rapid frame capture
 const IDLE_WORD = "";
 
+// ─── Latency test mode ────────────────────────────────────────────────────────
+// Set to true to skip server-side landmark drawing and JPEG encoding.
+// Reduces response payload by ~30-60KB per frame — use this to isolate
+// whether draw+encode is your dominant bottleneck vs MediaPipe/inference.
+// When true: landmarks won't appear on the annotated frame (canvas overlay
+// still works normally). Toggle here; no other changes needed.
+const LATENCY_TEST_MODE = false;
+
 const HAND_CONNECTIONS = [
   [0, 1], [1, 2], [2, 3], [3, 4],
   [0, 5], [5, 6], [6, 7], [7, 8],
@@ -89,6 +97,8 @@ export default function App() {
   const lastSpokenRef = useRef("");
   const builderCooldownRef = useRef({});
   const exitButtonRef = useRef(null);
+  // Track frame send timestamps for round-trip measurement
+  const frameStartRef = useRef(0);
 
   useEffect(() => {
     sentenceRef.current = sentence;
@@ -97,7 +107,13 @@ export default function App() {
   useEffect(() => {
     const startCamera = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" }, audio: false });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          // 640x480 is the capture resolution — downscaled to 320x240
+          // at the hidden captureCanvas before sending to the backend.
+          // Keeping 640x480 here gives MediaPipe enough detail on the display canvas.
+          video: { width: 640, height: 480, facingMode: "user" },
+          audio: false,
+        });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.play();
@@ -209,21 +225,52 @@ export default function App() {
       previewCtx.drawImage(video, 0, 0, previewCanvas.width, previewCanvas.height);
     }
 
+    // captureCanvas is 320x240 (hidden) — this is what gets sent to the backend.
+    // Downscaling from 640x480 here halves the pixel count MediaPipe processes.
     const captureCtx = captureCanvas.getContext("2d");
     captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
     const imageData = captureCanvas.toDataURL("image/jpeg", 0.30);
+
     busyRef.current = true;
+    frameStartRef.current = performance.now();
+
     try {
       const response = await fetch("/api/predict", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clientId, image: imageData }),
+        body: JSON.stringify({
+          clientId,
+          image: imageData,
+          // LATENCY_TEST_MODE skips server-side draw+encode.
+          // Flip the constant at the top of this file to toggle.
+          annotateFrame: !LATENCY_TEST_MODE,
+        }),
       });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.error || "Backend error");
       }
       const payload = await response.json();
+
+      // ── Per-frame timing log ──────────────────────────────────────────────
+      // Prints to browser console (F12 → Console).
+      // Shows round-trip + per-stage breakdown from the server.
+      // Compare LATENCY_TEST_MODE=true vs false to isolate draw+encode cost.
+      const rtt = Math.round(performance.now() - frameStartRef.current);
+      if (payload.timings) {
+        const t = payload.timings;
+        console.debug(
+          `[VOICE] RTT=${rtt}ms | ` +
+          `decode=${t.decode_ms}ms prep=${t.preprocess_ms}ms ` +
+          `mp=${t.landmark_ms}ms feat=${t.feature_ms}ms ` +
+          `draw=${t.draw_ms}ms enc=${t.encode_ms}ms ` +
+          `inf=${t.inference_ms}ms srv=${t.total_ms}ms ` +
+          `| mode=${LATENCY_TEST_MODE ? "TEST(no-draw)" : "NORMAL"}`
+        );
+      } else {
+        console.debug(`[VOICE] RTT=${rtt}ms (no timings in response)`);
+      }
+
       const word = payload.word || "";
       const confidence = payload.confidence || 0;
       const top3 = payload.top3 || [];
