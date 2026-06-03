@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 import cv2
@@ -63,33 +64,52 @@ label_map = {}
 client_buffers = {}
 client_lock = threading.Lock()
 
+# Single-worker pool keeps inference off the Flask request thread without
+# allowing concurrent TF calls (which aren't thread-safe on one model).
+_inference_pool = ThreadPoolExecutor(max_workers=1)
+
+# Run MediaPipe every Nth frame; reuse cached result on skipped frames.
+# smooth_landmarks=True makes this safe — MP already interpolates internally.
+# 2 = process every other frame (halves landmark cost, ~0 accuracy loss at 30fps).
+MP_FRAME_SKIP = 2
+
 mp_holistic = mp_solutions.holistic if mp_solutions is not None else None
-holistic = None
+mp_drawing  = mp_solutions.drawing_utils if mp_solutions is not None else None
 holistic_init_error = mp_import_error
 
+# ─────────────────────────────────────────────
+# Drawing styles — identical to the Streamlit app
+# cyan landmarks, purple connections
+# ─────────────────────────────────────────────
+if mp_drawing is not None:
+    HAND_STYLE = mp_drawing.DrawingSpec(color=(0, 212, 255), thickness=2, circle_radius=3)
+    CONN_STYLE = mp_drawing.DrawingSpec(color=(124, 58, 237), thickness=2)
+else:
+    HAND_STYLE = None
+    CONN_STYLE = None
 
-def init_holistic():
-    global holistic, holistic_init_error
-    if holistic is not None:
-        return holistic
-    if holistic_init_error is not None:
-        return None
+# JPEG encode quality for annotated frame (0-100).
+# 70 is a good balance: ~3-4x smaller than 95, visually identical at webcam res.
+ANNOTATED_FRAME_JPEG_QUALITY = 70
+
+
+def _make_holistic():
+    """
+    Create a fresh Holistic instance with the correct settings.
+    Called once per client so each session has independent tracking state —
+    prevents stale tracking from one session bleeding into the next,
+    which is a major cause of two-hand detection failures.
+    Returns the instance or raises so the caller can surface the error.
+    """
     if mp_holistic is None:
-        holistic_init_error = RuntimeError("mediapipe is unavailable")
-        return None
-
-    try:
-        holistic = mp_holistic.Holistic(
-            min_detection_confidence=0.4,
-            min_tracking_confidence=0.4,
-            model_complexity=2,  # Strongest two-hand tracking
-            smooth_landmarks=False,
-            enable_segmentation=False,
-        )
-        return holistic
-    except Exception as exc:
-        holistic_init_error = exc
-        return None
+        raise RuntimeError("mediapipe is unavailable")
+    return mp_holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+        model_complexity=0,        # fast enough for real-time; complexity 2 causes lag
+        smooth_landmarks=True,     # temporal smoothing — removes jitter between frames
+        enable_segmentation=False,
+    )
 
 
 def decode_image_data(data_url: str):
@@ -119,12 +139,56 @@ def extract_features(results) -> np.ndarray:
         pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float32)
         return normalize_hand(pts).flatten()
 
-    left = hand_arr(results.left_hand_landmarks)
+    # Keep original order — matches how features were extracted during training.
+    left  = hand_arr(results.left_hand_landmarks)
     right = hand_arr(results.right_hand_landmarks)
     return np.concatenate([left, right]).astype(np.float32)
 
 
+def draw_landmarks_on_frame(frame_rgb: np.ndarray, results) -> np.ndarray:
+    """
+    Draw hand landmarks directly onto the RGB frame, exactly like the Streamlit app.
+    Returns the annotated RGB frame (in-place draw on a copy).
 
+    This runs server-side so the frontend gets a pre-annotated JPEG — no canvas
+    overlay timing mismatch, no coordinate projection math needed in JS.
+    """
+    if mp_drawing is None or mp_holistic is None:
+        return frame_rgb
+
+    annotated = frame_rgb.copy()
+
+    if results.left_hand_landmarks:
+        mp_drawing.draw_landmarks(
+            annotated,
+            results.left_hand_landmarks,
+            mp_holistic.HAND_CONNECTIONS,
+            HAND_STYLE,
+            CONN_STYLE,
+        )
+    if results.right_hand_landmarks:
+        mp_drawing.draw_landmarks(
+            annotated,
+            results.right_hand_landmarks,
+            mp_holistic.HAND_CONNECTIONS,
+            HAND_STYLE,
+            CONN_STYLE,
+        )
+
+    return annotated
+
+
+def encode_frame_to_base64(frame_rgb: np.ndarray, quality: int = ANNOTATED_FRAME_JPEG_QUALITY) -> str:
+    """
+    Encode an RGB frame to a base64 JPEG data-URL.
+    Convert RGB→BGR for OpenCV imencode, then base64-wrap the result.
+    """
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    ok, buffer = cv2.imencode(".jpg", frame_bgr, encode_params)
+    if not ok:
+        return ""
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.tobytes()).decode("utf-8")
 
 
 class ModelRunner:
@@ -176,7 +240,6 @@ def load_model():
         except Exception:
             pass
 
-    import importlib
     import tensorflow as tf
 
     custom_objects = {
@@ -222,6 +285,13 @@ def cleanup_stale_clients():
     with client_lock:
         stale = [cid for cid, state in client_buffers.items() if now - state["updated"] > CLIENT_TIMEOUT_SECONDS]
         for cid in stale:
+            # Close the per-client Holistic instance to free MediaPipe resources
+            hol = client_buffers[cid].get("holistic")
+            if hol is not None:
+                try:
+                    hol.close()
+                except Exception:
+                    pass
             del client_buffers[cid]
 
 
@@ -229,7 +299,21 @@ def get_client_buffer(client_id: str):
     with client_lock:
         record = client_buffers.get(client_id)
         if record is None:
-            record = {"frames": deque(maxlen=SEQ_LEN), "updated": time.time()}
+            try:
+                client_holistic = _make_holistic()
+                hol_error = None
+            except Exception as exc:
+                client_holistic = None
+                hol_error = exc
+            record = {
+                "frames":        deque(maxlen=SEQ_LEN),
+                "updated":       time.time(),
+                "frame_count":   0,
+                "holistic":      client_holistic,   # per-client instance — independent tracking state
+                "hol_error":     hol_error,
+                "skip_counter":  0,                 # counts frames for MP_FRAME_SKIP
+                "last_results":  None,              # cached MediaPipe result for skipped frames
+            }
             client_buffers[client_id] = record
         else:
             record["updated"] = time.time()
@@ -247,7 +331,7 @@ def metrics():
     with client_lock:
         total_frames_processed = sum(state.get("frame_count", 0) for state in client_buffers.values())
         num_active_clients = len(client_buffers)
-    
+
     return jsonify({
         "status": "ok",
         "model_loaded": model_runner is not None,
@@ -369,6 +453,9 @@ def predict():
     if not image_data:
         return jsonify({"error": "Missing image data"}), 400
 
+    # Frontend opts out with "annotateFrame": false; default True.
+    want_annotated = payload.get("annotateFrame", True)
+
     try:
         t_decode_start = time.time()
         image = decode_image_data(image_data)
@@ -378,11 +465,15 @@ def predict():
     except Exception as exc:
         return jsonify({"error": f"Invalid image data: {exc}"}), 400
 
-    hol = init_holistic()
+    # ── Per-client buffer + holistic ──────────────────────────────────────────
+    buffer_record = get_client_buffer(client_id)
+
+    hol = buffer_record.get("holistic")
     if hol is None:
+        hol_error = buffer_record.get("hol_error")
         msg = "Mediapipe Holistic initialization failed"
-        if holistic_init_error is not None:
-            msg = f"Mediapipe Holistic initialization failed: {holistic_init_error}"
+        if hol_error is not None:
+            msg = f"{msg}: {hol_error}"
         return jsonify({"error": msg}), 503
 
     # Flip horizontally to match training data (model was trained on mirrored frames)
@@ -390,12 +481,19 @@ def predict():
     image = cv2.flip(image, 1)
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     t_preprocess = time.time() - t_preprocess_start
-    
+
+    # ── Frame-skip: run MediaPipe every MP_FRAME_SKIP frames ─────────────────
+    # On skipped frames reuse the cached result — smooth_landmarks=True means
+    # MediaPipe already smoothed internally, so the cached result is still valid.
     t_landmark_start = time.time()
-    results = hol.process(rgb_image)
+    buffer_record["skip_counter"] += 1
+    if buffer_record["skip_counter"] % MP_FRAME_SKIP == 0 or buffer_record["last_results"] is None:
+        results = hol.process(rgb_image)
+        buffer_record["last_results"] = results
+    else:
+        results = buffer_record["last_results"]   # reuse cached — costs ~0ms
     t_landmark = time.time() - t_landmark_start
 
-    buffer_record = get_client_buffer(client_id)
     progress = len(buffer_record["frames"]) / SEQ_LEN
 
     response = {
@@ -405,6 +503,7 @@ def predict():
         "confidence": 0.0,
         "top3": [],
         "landmarks": [],
+        "annotatedFrame": "",
     }
 
     def serialize_landmarks(results):
@@ -425,10 +524,20 @@ def predict():
     t_features_start = time.time()
     features = extract_features(results)
     t_features = time.time() - t_features_start
+
+    # Raw landmarks kept for backwards-compat
     response["landmarks"] = serialize_landmarks(results)
 
+    # ── Server-side landmark drawing ──────────────────────────────────────────
+    if want_annotated:
+        t_draw_start = time.time()
+        annotated_rgb = draw_landmarks_on_frame(rgb_image, results)
+        response["annotatedFrame"] = encode_frame_to_base64(annotated_rgb)
+        t_draw = time.time() - t_draw_start
+    else:
+        t_draw = 0.0
+
     buffer_record["frames"].append(features)
-    buffer_record.setdefault("frame_count", 0)
     buffer_record["frame_count"] += 1
     progress = len(buffer_record["frames"]) / SEQ_LEN
     response["bufferProgress"] = round(progress, 3)
@@ -437,14 +546,18 @@ def predict():
         return jsonify(response)
 
     seq = np.array(buffer_record["frames"], dtype=np.float32)[np.newaxis]
-    with model_lock:
-        try:
-            t_inference_start = time.time()
-            word, confidence, top3 = model_runner.predict(seq)
-            t_inference = time.time() - t_inference_start
-            buffer_record["last_prediction_time"] = request_start
-        except Exception as exc:
-            return jsonify({"error": f"Inference failed: {exc}"}), 500
+
+    # ── Non-blocking inference via thread pool ────────────────────────────────
+    # Submitting to the single-worker pool keeps TF off the Flask thread while
+    # still serialising calls (one model, one worker — no concurrent TF access).
+    try:
+        t_inference_start = time.time()
+        future = _inference_pool.submit(model_runner.predict, seq)
+        word, confidence, top3 = future.result(timeout=5.0)
+        t_inference = time.time() - t_inference_start
+        buffer_record["last_prediction_time"] = request_start
+    except Exception as exc:
+        return jsonify({"error": f"Inference failed: {exc}"}), 500
 
     response["top3"] = [
         {"label": item["label"].replace("_", " "), "confidence": round(item["confidence"], 4)}
@@ -454,13 +567,12 @@ def predict():
     if confidence >= CONF_THRESHOLD and word != "idle":
         response["word"] = word
 
-    # Log timing if enabled
     if ENABLE_TIMING_LOGS:
-        total_time = (time.time() - request_start) * 1000  # Convert to ms
+        total_time = (time.time() - request_start) * 1000
         logger.info(
             f"[{client_id[:8]}] TIMING: decode={t_decode*1000:.1f}ms prep={t_preprocess*1000:.1f}ms "
             f"landmark={t_landmark*1000:.1f}ms feature={t_features*1000:.1f}ms "
-            f"inference={t_inference*1000:.1f}ms total={total_time:.1f}ms "
+            f"draw={t_draw*1000:.1f}ms inference={t_inference*1000:.1f}ms total={total_time:.1f}ms "
             f"word={word} conf={confidence:.2f} frames={buffer_record['frame_count']}"
         )
 

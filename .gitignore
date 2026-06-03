@@ -18,3 +18,4 @@ build/
 .venv/
 .venv311/
 venv/
+frontend/.vite/
