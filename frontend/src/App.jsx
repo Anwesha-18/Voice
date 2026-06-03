@@ -73,7 +73,9 @@ export default function App() {
   const [sentence, setSentence] = useState([]);
   const sentenceRef = useRef([]);
   const [sentenceBuilderActive, setSentenceBuilderActive] = useState(false);
+  const [assistedCommunicationMode, setAssistedCommunicationMode] = useState(false);
   const [generatedSentence, setGeneratedSentence] = useState("");
+  const prevWordsRef = useRef(null);
   const [sentenceStatusBase, setSentenceStatusBase] = useState("");
   const [sentenceStatusDotCount, setSentenceStatusDotCount] = useState(0);
   const [autoSpeak, setAutoSpeak] = useState(true);
@@ -294,9 +296,13 @@ export default function App() {
 
   const handleSpeakSentence = () => {
     if (analyzing) return;
-    if (sentenceBuilderActive) {
-      if (!generatedSentence) return;
+    // Prefer the AI-generated sentence when available (assisted mode)
+    if (generatedSentence) {
       speakText(generatedSentence);
+      return;
+    }
+    if (sentenceBuilderActive) {
+      // No generated sentence yet
       return;
     }
     if (!sentence.length) return;
@@ -336,12 +342,17 @@ export default function App() {
 
   const handleStartSentenceBuilder = () => {
     clearSentenceStatusTimer();
+    // Save current words history so we can restore on exit
+    if (!assistedCommunicationMode) {
+      prevWordsRef.current = sentenceRef.current ? [...sentenceRef.current] : [];
+    }
     sentenceRef.current = [];
     setSentence([]);
     setGeneratedSentence("");
     setSentenceStatusBase("");
     setSentenceStatusDotCount(0);
     setSentenceBuilderActive(true);
+    setAssistedCommunicationMode(true);
     setError("");
     consecWordRef.current = null;
     consecCountRef.current = 0;
@@ -407,11 +418,19 @@ export default function App() {
     if (analyzing) return;
     clearSentenceStatusTimer();
     setSentenceBuilderActive(false);
+    setAssistedCommunicationMode(false);
+    // Restore previous words history if available
     setGeneratedSentence("");
     setSentenceStatusBase("");
     setSentenceStatusDotCount(0);
-    sentenceRef.current = [];
-    setSentence([]);
+    if (prevWordsRef.current) {
+      sentenceRef.current = [...prevWordsRef.current];
+      setSentence(sentenceRef.current);
+      prevWordsRef.current = null;
+    } else {
+      sentenceRef.current = [];
+      setSentence([]);
+    }
     consecWordRef.current = null;
     consecCountRef.current = 0;
     builderCooldownRef.current = {};
@@ -450,15 +469,36 @@ export default function App() {
             <button
               onClick={sentenceBuilderActive ? handleStopSentenceBuilder : handleStartSentenceBuilder}
               className={sentenceBuilderActive ? "btn-active-comm" : "camera-start-btn"}
-              disabled={analyzing || (generatedSentence && !sentenceBuilderActive)}
+              disabled={analyzing}
+              style={{
+                position: "relative",
+                paddingLeft: assistedCommunicationMode ? "32px" : "inherit"
+              }}
             >
-              {sentenceBuilderActive ? "Stop detecting" : "Start assisted communication mode"}
+              {assistedCommunicationMode && !sentenceBuilderActive && (
+                <span
+                  style={{
+                    position: "absolute",
+                    left: "6px",
+                    top: "50%",
+                    transform: "translateY(-50%)",
+                    width: "14px",
+                    height: "14px",
+                    backgroundColor: "#ff0000",
+                    borderRadius: "50%",
+                    display: "inline-block",
+                    animation: "signal-blink 0.8s ease-in-out infinite",
+                    boxShadow: "0 0 12px rgba(255, 0, 0, 1), 0 0 24px rgba(255, 0, 0, 0.7)"
+                  }}
+                />
+              )}
+              {sentenceBuilderActive ? "Stop detecting" : assistedCommunicationMode ? "Continue signing" : "Start assisted communication mode"}
             </button>
-            {(sentenceBuilderActive || generatedSentence) && (
+            {assistedCommunicationMode && (
               <button
                 ref={exitButtonRef}
                 onClick={handleExitCommunicationMode}
-                disabled={analyzing || (!sentenceBuilderActive && !generatedSentence)}
+                disabled={analyzing}
               >
                 Exit assisted communication mode
               </button>
@@ -496,12 +536,12 @@ export default function App() {
             <span>Auto speak</span>
           </div>
           <div className="button-row">
-            <button onClick={handleSpeakWord} disabled={sentenceBuilderActive || analyzing}>Speak word</button>
+            <button onClick={handleSpeakWord} disabled={sentenceBuilderActive || analyzing || assistedCommunicationMode}>Speak word</button>
             <button onClick={handleSpeakSentence} disabled={analyzing || (sentenceBuilderActive && !generatedSentence)}>
               Speak sentence
             </button>
-            <button onClick={handleRemove} disabled={sentenceBuilderActive || analyzing}>Remove last</button>
-            <button onClick={handleClear} disabled={analyzing}>Clear</button>
+            <button onClick={handleRemove} disabled={sentenceBuilderActive || analyzing || assistedCommunicationMode}>Remove last</button>
+            <button onClick={handleClear} disabled={analyzing || assistedCommunicationMode}>Clear</button>
           </div>
         </section>
 

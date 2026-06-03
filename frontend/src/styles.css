@@ -461,6 +461,17 @@ button {
   letter-spacing: 0.08em;
 }
 
+@keyframes signal-blink {
+  0%, 100% {
+    opacity: 1;
+    box-shadow: 0 0 8px rgba(255, 0, 0, 0.8), 0 0 16px rgba(255, 0, 0, 0.5);
+  }
+  50% {
+    opacity: 0.6;
+    box-shadow: 0 0 12px rgba(255, 0, 0, 1), 0 0 24px rgba(255, 0, 0, 0.7);
+  }
+}
+
 @media (max-width: 1040px) {
   .grid-layout {
     grid-template-columns: 1fr;
