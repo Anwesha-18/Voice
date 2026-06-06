@@ -19,11 +19,11 @@ import mediapipe as mp
 # CONFIG
 # ─────────────────────────────────────────────
 WORDS = [
-    "hello", "yes", "no", "stop", "thank_you", "help"
+    "hello", "yes", "no", "stop", "thank_you", "help", "food", "water", "bathroom", "please", "doctor", "medicine"
     ]
 
-SEQ_LEN        = 30          # frames per sequence
-TARGET_SEQS    = 30          # sequences per word
+SEQ_LEN        = 30        # frames per sequence
+TARGET_SEQS    = 50        # sequences per word
 COUNTDOWN_SECS = 3
 DATA_ROOT      = os.path.join(os.path.dirname(__file__), "..", "dataset", "raw_sequences")
 

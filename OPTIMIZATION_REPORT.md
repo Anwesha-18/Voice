@@ -1,222 +1,218 @@
-# Sign Language Recognition Latency Optimization Report
+# Sign Language Recognition Optimization Report
 
 ## Executive Summary
 
-Implemented multi-layer latency optimizations focused on faster recognition without modifying the 30-frame model architecture. Changes target frontend frame capture speed, confidence thresholds, word addition logic, and backend timing instrumentation.
+This report documents the current VOICE pipeline and identifies the most effective optimization opportunities for latency, accuracy, and robustness.
+
+The system is already optimized in several key areas:
+- browser-side capture at up to 40 FPS,
+- server-side MediaPipe frame skipping,
+- per-client Holistic tracking,
+- optional TFLite inference when available.
+
+The primary focus here is to describe what is implemented, what is measured, and where the next improvements should be made.
 
 ---
 
-## Optimization Changes
+## Current system state
 
-### 1. Backend Confidence Threshold Optimization
+### Pipeline overview
 
-**File:** `backend/app.py`
+1. Browser captures webcam frames at `CAPTURE_INTERVAL_MS = 25` ms.
+2. Frames are downscaled to `320×240`, JPEG-compressed at quality `0.30`, and sent to `/api/predict`.
+3. The backend flips the image, converts to RGB, and runs MediaPipe Holistic.
+4. Hand landmarks are normalized and concatenated into `126` features.
+5. A rolling buffer of `SEQ_LEN = 30` frames is collected per client.
+6. Once the buffer is full, the backend runs model inference and returns the best word plus top-3 scores.
+7. The frontend appends words to the sentence only when the prediction is stable enough.
 
-**Changes:**
-- `CONF_THRESHOLD`: 0.70 → 0.60 (-14% stricter requirement)
-- `APPEND_THRESHOLD`: 0.60 → 0.55 (-8% stricter requirement)
+### Current thresholds and controls
 
-**Rationale:**
-- The 0.70 threshold was conservative, rejecting marginal predictions that users could still recognize.
-- Lowering to 0.60 balances responsiveness with accuracy.
-- Frontend APPEND_THRESHOLD of 0.55 allows words to be added at lower confidence, enabling faster sentence building.
+- Backend confidence threshold: `CONF_THRESHOLD = 0.55`
+- Frontend append threshold: `APPEND_THRESHOLD = 0.50`
+- Word append persistence: `APPEND_FRAMES = 1`
+- Repeat-word cooldown: `600 ms`
+- MediaPipe frame skip: `MP_FRAME_SKIP = 3`
 
-**Impact:**
-- ⚡ Faster word recognition without model retraining
-- ⚠️ Slight increase in false positives (mitigated by consecutive-frame requirement)
+### Supported classes
 
----
+The current data collection and dataset builder scripts are configured for these 12 words:
+- `hello`, `yes`, `no`, `stop`, `thank_you`, `help`, `food`, `water`, 'medicine', 'doctor','please','bathroom'
 
-### 2. Frontend Frame Capture Frequency
+> Note: the codebase contains additional raw folders, but `collect_data.py` and `build_dataset.py` currently use this reduced set.
 
-**File:** `frontend/src/App.jsx`
+### Backend inference support
 
-**Changes:**
-- `CAPTURE_INTERVAL_MS`: 40ms → 33ms
-- **Frame rate:** 25 FPS → 30 FPS (+20% more frequent predictions)
+The backend loads one of:
+- `outputs/saved_models/best_model.tflite` if available,
+- otherwise `outputs/saved_models/best_model.h5`.
 
-**Rationale:**
-- Increases prediction frequency from every 40ms to every 33ms.
-- Fills the 30-frame buffer faster: 30 × 33ms = 990ms (vs. 1200ms at 25 FPS).
-- Provides more gesture context in the same wall-clock time.
-
-**Impact:**
-- ⚡ ~210ms faster initial buffer filling
-- ⚠️ Minimal CPU overhead (still ~30 predictions/sec, manageable)
+This enables faster TensorFlow Lite inference when the model has been converted.
 
 ---
 
-### 3. Frontend Word Addition Logic
+## Measured latency characteristics
 
-**File:** `frontend/src/App.jsx`
+### Frontend capture and transport
 
-**Changes:**
-- `APPEND_FRAMES`: 4 → 2 (consecutive prediction requirement)
-- **Delay before word addition:** 160ms → 80ms (-50% faster word addition)
+- Frame capture interval: `25 ms` → theoretical 40 FPS.
+- Effective frame send time depends on network and backend processing.
+- Downscaling to `320×240` and JPEG compression reduces payload size.
 
-**Rationale:**
-- Originally required 4 consecutive predictions (4 × 33ms = 132ms) before adding a word.
-- Reducing to 2 maintains stability while halving the delay.
-- Still provides protection against flickering predictions.
+### Backend processing stages
 
-**Impact:**
-- ⚡ 80ms faster from "confident prediction" to "word added"
-- ✅ Minimal false positive risk (2 consecutive frames is still a stability guard)
+- Decode base64 JPEG
+- Flip and convert to RGB
+- MediaPipe Holistic processing every third frame
+- Feature extraction and normalization
+- Optional server-side landmark drawing and JPEG encoding
+- Model inference via TFLite or TensorFlow Keras
 
----
+The backend returns timing information for each stage in every `/api/predict` response. The frontend logs these values to the browser console when available.
 
-### 4. Sentence Builder Cooldown Optimization
+### Current latency optimizations in code
 
-**File:** `frontend/src/App.jsx`
-
-**Changes:**
-- Word cooldown: 1200ms → 800ms (-33% faster back-to-back words)
-
-**Rationale:**
-- Original cooldown prevented the same word from appearing within 1.2 seconds.
-- Reduced to 800ms allows for natural speech patterns (e.g., "please please" or "help help").
-- Combined with consecutive-frame requirement, maintains duplicate prevention.
-
-**Impact:**
-- ⚡ Faster construction of multi-word sentences with repetition
-- ✅ Still prevents rapid accidental duplicates
+- `MP_FRAME_SKIP = 3` reduces MediaPipe cost while preserving temporal smoothing.
+- Server keeps a per-client Holistic instance for stable gesture history.
+- Inference is executed in a dedicated single-worker thread pool to avoid blocking Flask request handling.
+- Word output is suppressed for `idle` and low-confidence predictions.
+- Sentence generator falls back to heuristic output if Gemini is unavailable.
 
 ---
 
-### 5. Backend Timing Instrumentation
+## What is already optimized
 
-**File:** `backend/app.py`
+### Frontend
 
-**Added:**
-- Per-request timing logs for each pipeline stage:
-  - Image decode time
-  - Image preprocessing (flip, color conversion)
-  - MediaPipe landmark extraction
-  - Feature extraction
-  - Model inference
-  - Total round-trip time
+- High capture frequency: `25 ms` / 40 FPS possible.
+- Small payloads: `320×240` capture resolution + JPEG quality 0.30.
+- Single-frame append logic for rapid sentence assembly.
 
-- New endpoint: `GET /api/metrics`
-  - Returns active client count, frames processed, current thresholds
-  - Helps monitor system load and configuration
+### Backend
 
-**Rationale:**
-- Identifies bottleneck stages for future optimization.
-- Enables detailed latency profiling without modifying model inference.
+- Frame batching with a rolling buffer of 30 frames.
+- MediaPipe skip optimization: process every 3rd frame.
+- TFLite support for faster inference when available.
+- Per-client memory cleanup for stale sessions.
 
-**How to enable:**
-```bash
-# On Windows PowerShell
-$env:ENABLE_TIMING_LOGS = 'true'
-python backend/app.py
+### Model
 
-# On Linux/Mac
-export ENABLE_TIMING_LOGS=true
-python backend/app.py
-```
-
-**Impact:**
-- 📊 Visibility into per-stage latency
-- 🔧 Foundation for future optimization
+- Lightweight BiLSTM + attention architecture.
+- 126-feature input keeps the model compact.
+- Training script adds Gaussian noise and class-weight balancing.
 
 ---
 
-## Expected Latency Improvements
+## Optimization opportunities
 
-| Stage | Before | After | Improvement |
-|-------|--------|-------|-------------|
-| Buffer fill time | 1200ms | 990ms | -210ms |
-| Word addition delay | 160ms | 80ms | -80ms |
-| Word repeat cooldown | 1200ms | 800ms | -400ms |
-| **Total (first recognition)** | ~1360ms | ~1070ms | **-290ms (-21%)** |
-| **Back-to-back words** | ~1200ms apart | ~800ms apart | **-400ms (-33%)** |
+These are the highest-value improvements to pursue next.
 
----
+### 1. Verify and use TFLite inference
 
-## Stability Protections Maintained
+If `outputs/saved_models/best_model.tflite` exists, the backend will use it automatically. If your current model is still H5-only, convert it with `model/convert_tflite.py` and validate end-to-end latency.
 
-✅ **Consecutive-frame requirement**: Still requires 2 consecutive predictions (80ms)
-✅ **Double prediction prevention**: Checks if word == lastWord before adding
-✅ **Duplicate suppression per-word**: Per-word cooldown still active (800ms)
-✅ **Model inference intact**: No changes to 30-frame sequence or model loading
+Benefit: reduced inference time and lower CPU usage.
 
----
+### 2. Measure server-side annotation cost
 
-## Testing Recommendations
+The API supports an optional latency test mode that disables landmark drawing and JPEG encoding.
 
-1. **Latency Test**: Capture timing logs with `ENABLE_TIMING_LOGS=true` and measure:
-   - Time from gesture start to word recognition
-   - Time from confidence threshold to word addition
-   - Backend latency breakdown
+- If drawing + encoding is a dominant cost, keep `LATENCY_TEST_MODE = true` in `frontend/src/App.jsx` during profiling.
+- If this stage is expensive, move annotation to the browser or skip it entirely in production.
 
-2. **Accuracy Test**: Monitor false positive rate in Sentence Builder:
-   - Check if lower thresholds introduce unwanted extra words
-   - Adjust `CONF_THRESHOLD` further if needed (min recommended: 0.55)
+### 3. Tune MediaPipe frame skipping adaptively
 
-3. **Load Test**: Monitor CPU usage at 30 FPS with multiple clients:
-   - 1 client: Expected ~10-15% CPU per device
-   - Multiple clients: Check if MediaPipe extraction scales linearly
+`MP_FRAME_SKIP = 3` is a good default, but a dynamic policy could give better tradeoffs:
+- lower skip when motion is present,
+- higher skip during static periods.
 
----
+Benefit: reduce CPU usage while preserving landmark fidelity.
 
-## Configuration Parameters
+### 4. Improve sentence stability without slowing recognition
 
-Key tunable parameters for future adjustment:
+Current frontend settings already favor responsiveness:
+- `APPEND_FRAMES = 1`
+- `APPEND_THRESHOLD = 0.50`
 
-| Parameter | Current | Min | Max | File |
-|-----------|---------|-----|-----|------|
-| `CONF_THRESHOLD` | 0.60 | 0.50 | 0.80 | backend/app.py |
-| `APPEND_THRESHOLD` | 0.55 | 0.50 | 0.70 | frontend/src/App.jsx |
-| `APPEND_FRAMES` | 2 | 1 | 4 | frontend/src/App.jsx |
-| `CAPTURE_INTERVAL_MS` | 33 | 20 | 50 | frontend/src/App.jsx |
-| Word cooldown | 800 | 400 | 1500 | frontend/src/App.jsx |
+If false positives appear, increase `APPEND_FRAMES` to `2` or raise `APPEND_THRESHOLD` gradually until the balance is acceptable.
+
+### 5. Expand or regularize gesture classes
+
+The dataset and model are currently limited to 8 configured words. If you want to support more gestures:
+- update `WORDS` in `preprocessing/collect_data.py`
+- update `WORDS` in `preprocessing/build_dataset.py`
+- collect additional sequences for each new class
+- retrain the model
+
+Benefit: broader vocabulary and more natural phrase generation.
 
 ---
 
-## Future Optimization Opportunities
+## Recommended testing strategy
 
-1. **Image quality optimization**: Currently 0.30 JPEG quality. Test 0.25 for payload reduction.
-2. **Async processing**: Consider async image decode on backend.
-3. **Caching**: Cache MediaPipe Holistic instance per-thread.
-4. **Model quantization**: If available, use TFLite quantized model for faster inference.
-5. **Batching**: For multi-client scenarios, batch inference requests.
+### Latency validation
 
----
+Use the browser console and `/api/metrics` to measure:
+- round-trip time for `/api/predict`
+- per-stage backend timings
+- active client count
+- total frames processed
 
-## Files Modified
+### Accuracy validation
 
-- `backend/app.py`
-  - Added timing instrumentation
-  - Lowered confidence thresholds
-  - Added `/api/metrics` endpoint
+Check the live UI for:
+- correct top-1 word selection
+- stability of consecutive word appending
+- false positives from low-confidence predictions
 
-- `frontend/src/App.jsx`
-  - Increased capture frequency (40ms → 33ms)
-  - Reduced APPEND_FRAMES (4 → 2)
-  - Reduced word cooldown (1200ms → 800ms)
-  - Lowered APPEND_THRESHOLD (0.60 → 0.55)
+If accuracy drops, tune `CONF_THRESHOLD` or `APPEND_THRESHOLD` while preserving the fastest acceptable response.
 
----
+### Resource validation
 
-## Validation
-
-✅ Frontend builds successfully
-✅ Backend syntax valid
-✅ No model architecture changes
-✅ 30-frame sequence requirement preserved
-✅ Sentence Builder functionality intact
-✅ Gemini integration unchanged
+Monitor CPU and memory usage on the backend machine.
+- MediaPipe and TensorFlow are the heaviest components.
+- TFLite inference usually reduces CPU compared to H5.
 
 ---
 
-## Summary
+## Recommended configuration ranges
 
-These optimizations target latency across the entire pipeline:
-- **Frontend**: Faster capture and prediction requests
-- **Logic**: Faster word addition with maintained stability
-- **Backend**: Visibility into bottlenecks via timing logs
-- **Configuration**: Conservative threshold adjustments for responsiveness
+| Parameter | Current | Suggested range | Notes |
+|-----------|---------|-----------------|-------|
+| `CONF_THRESHOLD` | `0.55` | `0.50–0.70` | Lower improves latency; higher improves precision |
+| `APPEND_THRESHOLD` | `0.50` | `0.50–0.65` | Affects when the frontend accepts a word |
+| `APPEND_FRAMES` | `1` | `1–3` | More frames improves stability, slower response |
+| `CAPTURE_INTERVAL_MS` | `25` | `20–40` | Faster capture increases responsiveness but raises CPU/network load |
+| `MP_FRAME_SKIP` | `3` | `2–4` | Tradeoff between MediaPipe latency and motion fidelity |
+| Back-to-back cooldown | `600 ms` | `400–1000 ms` | Controls repeated word suppression |
 
-**Expected result:** ~20-30% faster recognition and word addition while maintaining accuracy and preventing false positives.
+---
 
-Enable timing logs and monitor `/api/metrics` to validate improvements in your environment.
+## Practical recommendations
+
+1. Keep `APPEND_FRAMES` at `1` if you want the fastest recognition path.
+2. Use `APPEND_THRESHOLD = 0.50` for aggressive recognition, and increase it if false positives become a problem.
+3. If latency is still high, enable `LATENCY_TEST_MODE` and compare timings with and without server-side annotating.
+4. Prefer the `.tflite` model in production to reduce inference cost.
+5. Add new gestures by extending the configured `WORDS` list and rebuilding the dataset.
+
+---
+
+## Notes on current implementation
+
+- The backend logs detailed timings for every `/api/predict` response.
+- The frontend currently implements a single-frame append rule for rapid sentence construction.
+- `generate-sentence` uses Gemini when available, otherwise falls back to a deterministic heuristic.
+- `dataset/raw_sequences/` contains many folders, but the current pipeline only consumes the 8 configured gestures.
+
+---
+
+## Conclusion
+
+The VOICE system is already optimized around a fast capture-to-prediction loop. The next improvements should focus on:
+- verifying TFLite inference,
+- measuring server-side annotation costs,
+- tuning thresholds to the desired accuracy/latency balance,
+- and expanding the gesture vocabulary in a controlled way.
+
+These changes will deliver the best return without requiring major architecture rewrites.

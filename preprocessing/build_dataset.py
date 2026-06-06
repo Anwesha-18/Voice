@@ -18,7 +18,7 @@ RAW_DIR   = os.path.join(BASE_DIR, "dataset", "raw_sequences")
 PROC_DIR  = os.path.join(BASE_DIR, "dataset", "processed")
 
 WORDS = [
-    "hello", "yes", "no", "stop", "thank_you", "help"
+    "hello", "yes", "no", "stop", "thank_you", "help", "food", "water", "bathroom", "please", "doctor", "medicine"
 ]
 
 SEQ_LEN      = 30

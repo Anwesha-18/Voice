@@ -1,174 +1,320 @@
 # VOICE
 
-**Real-time sign language recognition system** — recognises 21 ASL-inspired signs from your webcam, builds sentences, and speaks them aloud.
+**VOICE** is a real-time sign language communication system built with:
+- a browser frontend using webcam capture,
+- a Flask backend with MediaPipe hand landmark extraction,
+- a BiLSTM + attention classifier,
+- sentence building and speech output.
+
+This project is designed to convert short hand gesture sequences into words, then build simple phrases for assisted communication.
 
 ---
 
-## Quick Start
+## Project overview
 
-```
-VOICE/
-├── dataset/
-│   └── raw_sequences/<word>/seq_XXX.npy
-├── preprocessing/
-│   ├── collect_data.py      ← Step 1
-│   └── build_dataset.py     ← Step 2
-├── model/
-│   ├── architectures.py
-│   └── train.py             ← Step 3
-├── backend/
-│   ├── app.py               ← Flask inference server
-│   └── requirements.txt
-├── frontend/
-│   ├── index.html
-│   ├── package.json
-│   ├── src/
-│   │   ├── App.jsx
-│   │   ├── main.jsx
-│   │   └── styles.css
-│   └── vite.config.js
-├── outputs/
-│   └── saved_models/
-│       ├── best_model.h5
-│       ├── label_map.json
-│       └── model_config.json
-└── requirements.txt
-```
+The repository is organized into four main layers:
+
+- `dataset/` — raw `.npy` gesture sequences and processed training arrays.
+- `preprocessing/` — data collection and dataset construction scripts.
+- `model/` — deep learning architecture, training logic, and TFLite conversion support.
+- `backend/` — Flask inference server, prediction endpoints, and optional Gemini sentence generation.
+- `frontend/` — React + Vite app for live webcam capture, prediction display, and speech output.
+
+---
+
+## Supported workflow
+
+1. Collect gesture data with `preprocessing/collect_data.py`
+2. Build the processed dataset with `preprocessing/build_dataset.py`
+3. Train the sequence model with `model/train.py`
+4. Run the backend and frontend together for live recognition
 
 ---
 
 ## Installation
 
+### Python backend
+
+1. Create and activate a Python virtual environment.
+2. Install backend dependencies:
+
 ```bash
+cd backend
 pip install -r requirements.txt
 ```
 
-> Python 3.9–3.11 recommended. On Apple Silicon, install `tensorflow-macos` instead of `tensorflow`.
+If you are using Apple Silicon, install `tensorflow-macos` instead of the default `tensorflow` package.
 
----
+### Frontend
 
-## Step-by-Step Usage
-
-### 1 — Collect Data
+1. Install Node dependencies:
 
 ```bash
-cd GESTURESPEAK
-python preprocessing/collect_data.py
+cd frontend
+npm install
 ```
 
-**Controls:**
-| Key | Action |
-|-----|--------|
-| `SPACE` | Start recording a sequence (3-second countdown) |
-| `N` | Next word |
-| `P` | Previous word |
-| `Q` | Quit |
+2. Start the app:
 
-- Records **30 sequences × 21 words = 630 sequences** total
-- Each sequence = 30 frames of hand landmarks
-- Auto-advances when a word reaches its target (30 sequences)
-- Progress bar shows how many sequences have been captured
+```bash
+npm run dev
+```
 
-**Tips for good data:**
-- Record `idle` with hands resting still, fidgeting, and mid-transition between signs
-- Vary lighting, hand position slightly, and speed across sequences
-- `idle` is the most important class — it prevents false positives when you're not signing
+The frontend runs at `http://localhost:3000` and communicates with the Flask backend on `http://localhost:5000`.
 
 ---
 
-### 2 — Build Dataset
+## Data collection
+
+The collection script records 30-frame sequences of hand landmarks and saves them as `.npy` files.
+
+### Current words tracked by `collect_data.py`
+
+- `hello`
+- `yes`
+- `no`
+- `stop`
+- `thank_you`
+- `help`
+- `food`
+- `water`
+- 'medicine'
+- 'doctor'
+- 'please'
+- 'bathroom'
+
+> Note: The repository contains additional raw folders, but the current collection and dataset builder scripts are configured for these 8 words.
+
+### Controls
+
+- `SPACE` — start recording a sequence after a 3-second countdown
+- `N` — advance to the next word
+- `P` — go back to the previous word
+- `Q` — quit the collector
+
+### Recording details
+
+- Each sequence uses `SEQ_LEN = 30` frames.
+- Each frame encodes `FEATURE_SIZE = 126` features.
+- Default target sequences per word: `TARGET_SEQS = 50`.
+- The script auto-advances to the next word after hitting the target count.
+
+### Recommended capture tips
+
+- Keep lighting even and avoid harsh shadows.
+- Move hands naturally, but keep each sign clearly separated.
+- Capture both left and right hand poses when available.
+- Save multiple examples of the same word to improve generalization.
+
+---
+
+## Building the dataset
+
+Run:
 
 ```bash
 python preprocessing/build_dataset.py
 ```
 
-- Loads all `.npy` sequences
-- Stratified 80/20 train/test split
-- Saves `dataset/processed/X_train.npy`, `X_test.npy`, `y_train.npy`, `y_test.npy`
-- Saves `label_map.json`
+What it does:
+
+- loads raw `.npy` sequences from `dataset/raw_sequences`
+- validates each sequence shape is `(30, 126)`
+- performs a stratified `80/20` train/test split
+- saves:
+  - `dataset/processed/X_train.npy`
+  - `dataset/processed/X_test.npy`
+  - `dataset/processed/y_train.npy`
+  - `dataset/processed/y_test.npy`
+  - `dataset/processed/label_map.json`
+
+The dataset builder currently requires at least 2 samples per class for stratified splitting.
 
 ---
 
-### 3 — Train
+## Training the model
+
+Run:
 
 ```bash
 python model/train.py
 ```
 
-- Trains **BiLSTM + Attention** model for up to 50 epochs
-- EarlyStopping (patience=10), ReduceLROnPlateau, ModelCheckpoint
-- Best model saved to `outputs/saved_models/best_model.h5`
-- Accuracy/loss curves → `outputs/training_curves.png`
-- Confusion matrix → `outputs/confusion_matrix.png`
-- Training log → `outputs/training_log.csv`
+Training pipeline details:
 
-Typical training time: 5–15 min on CPU, 1–3 min with GPU.
+- Uses a BiLSTM + attention architecture from `model/architectures.py`.
+- Applies Gaussian noise augmentation to training sequences.
+- Uses class-weight balancing for imbalanced gesture labels.
+- Monitors validation accuracy and saves the best checkpoint to `outputs/saved_models/best_model.h5`.
+- Generates:
+  - `outputs/training_log.csv`
+  - `outputs/training_curves.png`
+  - `outputs/confusion_matrix.png`
+- Also saves the label map and model metadata in `outputs/saved_models/`.
+
+### Training parameters
+
+- `SEQ_LEN = 30`
+- `FEATURE_SIZE = 126`
+- `EPOCHS = 50`
+- `BATCH_SIZE = 32`
+- `NOISE_STD = 0.005`
 
 ---
 
-### 4 — Run App
+## Model architecture
+
+The model accepts a `30 × 126` input sequence and computes a class probability over gesture labels.
+
+Architecture summary:
+
+- Input layer: `(30, 126)`
+- Bidirectional LSTM 128 → dropout 0.2 + 0.3
+- Bidirectional LSTM 64 → dropout 0.2 + 0.3
+- Custom attention layer over timesteps
+- Dense 128 → BatchNorm → dropout 0.4
+- Dense 64 → dropout 0.3
+- Output dense with softmax over classes
+
+### Feature representation
+
+- Each frame contains 126 features:
+  - left hand: 21 landmarks × 3 coordinates
+  - right hand: 21 landmarks × 3 coordinates
+- Each hand is wrist-normalized and scale-normalized.
+- Missing hands are represented by zero vectors.
+- Face landmarks are excluded to keep the model small and privacy-friendly.
+
+---
+
+## Backend inference server
+
+Run the backend with:
 
 ```bash
-pip install -r backend/requirements.txt
+python backend/app.py
+```
+
+The server provides:
+
+- `POST /api/predict` — accepts base64 JPEG webcam frames and returns predictions
+- `POST /api/generate-sentence` — converts collected words into a natural sentence
+- `GET /api/metrics` — returns backend health and buffer statistics
+- `GET /api/ping` — simple health check
+
+### Backend behavior
+
+- Loads `outputs/saved_models/best_model.tflite` if available.
+- Falls back to `best_model.h5` otherwise.
+- Uses per-client MediaPipe Holistic state for stable hand landmark tracking.
+- Runs MediaPipe every `MP_FRAME_SKIP = 3` frames to improve latency.
+- Uses `CONF_THRESHOLD = 0.55` to suppress low-confidence predictions.
+- Only non-`idle` words pass to the frontend.
+
+### Optional sentence generation
+
+The sentence generation endpoint tries to call Gemini if `GEMINI_API_KEY` is set.
+If Gemini is unavailable, the backend returns a heuristic fallback sentence.
+
+To use Gemini, add a `.env` file in the repo root with:
+
+```env
+GEMINI_API_KEY=your_api_key_here
+```
+
+---
+
+## Frontend app
+
+The frontend is implemented in React with Vite and renders a neon-style live camera interface.
+
+Key features:
+
+- Captures video from the browser webcam.
+- Downscales frames to `320×240` before sending to the backend.
+- Sends JPEG images at quality `0.30` for smaller payloads.
+- Displays live hand landmark overlays.
+- Shows current prediction, confidence, and buffer progress.
+- Automatically speaks recognized words using browser TTS.
+- Supports assisted communication mode with sentence generation.
+
+### Frontend thresholds
+
+The current frontend thresholds are:
+
+- `CAPTURE_INTERVAL_MS = 25` — captures frames at up to 40 FPS
+- `APPEND_THRESHOLD = 0.50` — confidence threshold for word appending
+- `APPEND_FRAMES = 1` — appends a word after one confident prediction
+- Back-to-back word cooldown: `600 ms`
+
+---
+
+## Running the full system
+
+1. Start the backend:
+
+```bash
+cd backend
+python app.py
+```
+
+2. Start the frontend:
+
+```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-Open the React UI at `http://localhost:3000`. The frontend proxies `/api` calls to the Flask server on port `5000`.
+3. Open `http://localhost:3000`
 
-**Features:**
-- 🎥 Browser webcam capture with fast preview
-- 🔤 Neon prediction display with live confidence
-- 📊 Top-3 scoring and buffer progress
-- 📝 Sentence builder with automatic append logic
-- 🔊 Browser-native speech synthesis (no `pyttsx3` dependency)
-- ✨ Futuristic dark neon UI with responsive layout
-
-**Word is appended to sentence when:**
-- Confidence ≥ 60%
-- Same word held for several consecutive frames
-- Word is not `idle`
-- Word differs from the last appended word
-
----
-
-## Recognised Signs (21 classes)
-
-`hello` · `yes` · `no` · `please` · `thank_you` · `sorry` · `help` · `stop` · `eat` · `food` · `drink` · `water` · `who` · `where` · `what` · `i` · `want` · `need` · `bathroom` · `doctor` · `idle`
-
----
-
-## Model Architecture
-
-```
-Input (30, 126)
-  → BiLSTM(128, return_sequences=True) + Dropout(0.3)
-  → BiLSTM(64,  return_sequences=True) + Dropout(0.3)
-  → Soft Attention (weighted sum over timesteps)
-  → Dense(128, relu) → BatchNorm → Dropout(0.4)
-  → Dense(64, relu)  → Dropout(0.3)
-  → Dense(21, softmax)
-```
-
-**Features:** 126 per frame = left hand (63) + right hand (63)  
-Each hand = 21 landmarks × 3 (x, y, z), wrist-normalised and scale-normalised.  
-Face landmarks deliberately excluded to keep the model lightweight and privacy-friendly.
+4. Allow camera access when prompted.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Solution |
-|---------|----------|
-| Webcam not detected | Try `cv2.VideoCapture(1)` or `(2)` |
-| Model not loading | Ensure step 1–3 are complete; check `outputs/saved_models/` |
-| TTS silent | `pyttsx3` may need system TTS engine; try `espeak` on Linux |
-| Low accuracy | Collect more `idle` data; ensure consistent lighting |
-| `idle` triggers mid-sign | Increase `APPEND_FRAMES` constant in `app.py` |
+### Common issues
+
+- `Model not loaded`
+  - Ensure `outputs/saved_models/best_model.h5` or `best_model.tflite` exists.
+  - Run `python model/train.py` if no model is present.
+
+- `Unable to access camera`
+  - Check browser permissions.
+  - Confirm the correct webcam is selected.
+
+- `Gemini API key missing`
+  - Add `GEMINI_API_KEY` to `.env` if you want sentence generation.
+
+- Slow performance
+  - Confirm backend uses TFLite if available.
+  - Reduce frame rate or lower model complexity.
+
+### Notes
+
+- `dataset/raw_sequences/` may contain more folders than the current dataset builder uses.
+- To add new gesture classes, update the `WORDS` list in `preprocessing/collect_data.py` and `preprocessing/build_dataset.py`.
+
+---
+
+## Directory reference
+
+```text
+VOICE/
+├── backend/                # Flask inference server + dependencies
+├── dataset/
+│   ├── processed/          # saved training arrays and label map
+│   └── raw_sequences/      # collected gesture `.npy` sequences
+├── frontend/               # React UI and live webcam experience
+├── model/                  # model architecture and training logic
+├── outputs/                # training outputs and saved model artifacts
+├── preprocessing/          # data collection and dataset builder scripts
+├── OPTIMIZATION_REPORT.md  # latency and performance analysis
+└── README.md               # this file
+```
 
 ---
 
 ## License
 
-MIT — use freely for personal, educational, and research purposes.
+MIT License.
